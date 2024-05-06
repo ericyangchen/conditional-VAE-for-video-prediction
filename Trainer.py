@@ -15,6 +15,7 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.utils import save_image
+from torch.utils.tensorboard import SummaryWriter
 
 from dataloader import Dataset_Dance
 from modules import (
@@ -41,26 +42,59 @@ def kl_criterion(mu, logvar, batch_size):
 
 class kl_annealing:
     def __init__(self, args, current_epoch=0):
-        # TODO
-        raise NotImplementedError
+        self.kl_anneal_type = args.kl_anneal_type
+        self.kl_anneal_cycle = args.kl_anneal_cycle
+        self.kl_anneal_ratio = args.kl_anneal_ratio
 
-    def update(self):
-        # TODO
-        raise NotImplementedError
+        self.beta = 0.001
+        if self.kl_anneal_type == "Without":
+            self.beta = 1.0
+
+    def update(self, current_epoch):
+        if self.kl_anneal_type == "Cyclical":
+            self.beta = self.frange_cycle_linear(
+                current_epoch,
+                start=0.0,
+                stop=1.0,
+                n_cycle=self.kl_anneal_cycle,
+                ratio=self.kl_anneal_ratio,
+            )
+        elif self.kl_anneal_type == "Monotonic":
+            self.beta = self.frange_monotonic(
+                current_epoch,
+                start=0.0,
+                stop=1.0,
+                n_cycle=self.kl_anneal_cycle,
+                ratio=self.kl_anneal_ratio,
+            )
 
     def get_beta(self):
-        # TODO
-        raise NotImplementedError
+        return self.beta
 
     def frange_cycle_linear(self, n_iter, start=0.0, stop=1.0, n_cycle=1, ratio=1):
-        # TODO
-        raise NotImplementedError
+        new_beta = (n_iter % n_cycle) / n_cycle * ratio
+        new_beta = round(new_beta, 5)
+        new_beta = min(new_beta, stop)
+
+        return new_beta
+
+    def frange_monotonic(self, n_iter, start=0.0, stop=1.0, n_cycle=1, ratio=1):
+        delta = ratio / n_cycle
+
+        new_beta = round(n_iter * delta, 5)
+        new_beta = min(new_beta, stop)
+
+        return new_beta
 
 
 class VAE_Model(nn.Module):
     def __init__(self, args):
         super(VAE_Model, self).__init__()
         self.args = args
+
+        # tensorboard writer
+        if not self.args.test:
+            self.writer = SummaryWriter(log_dir=f"{args.save_root}/logs")
 
         # Modules to transform image from RGB-domain to feature-domain
         self.frame_transformation = RGB_Encoder(3, args.F_dim)
@@ -81,7 +115,7 @@ class VAE_Model(nn.Module):
         self.scheduler = optim.lr_scheduler.MultiStepLR(
             self.optim, milestones=[2, 5], gamma=0.1
         )
-        # self.kl_annealing = kl_annealing(args, current_epoch=0)
+        self.kl_annealing = kl_annealing(args, current_epoch=0)
         self.mse_criterion = nn.MSELoss()
         self.current_epoch = 0
 
@@ -94,25 +128,74 @@ class VAE_Model(nn.Module):
         self.val_vi_len = args.val_vi_len
         self.batch_size = args.batch_size
 
-    def forward(self, img, label):
-        pass
+    def forward(self, x_frame, y_pose, y_frame):
+        # train posterior predictor (y_frame: t frame, y_pose: t pose)
+        y_frame_feature = self.frame_transformation(y_frame)
+        y_pose_feature = self.label_transformation(y_pose)
+        z, mu, logvar = self.Gaussian_Predictor(y_frame_feature, y_pose_feature)
+
+        # train generator (x_frame: t-1 frame, y_pose: t pose, z: noise vector)
+        x_frame_feature = self.frame_transformation(x_frame)
+        decoder_output = self.Decoder_Fusion(x_frame_feature, y_pose_feature, z)
+
+        # predicted y frame (predicted t frame)
+        pred_frame = self.Generator(decoder_output)
+
+        return mu, logvar, pred_frame
+
+    def forward_inference(self, x_frame, y_pose):
+        # noise vector
+        z = torch.randn(1, self.args.N_dim, self.args.frame_H, self.args.frame_W)
+        z = z.to(self.args.device)
+
+        # val generator (x_frame: t-1 frame, y_pose: t pose, z: noise vector)
+        x_frame_feature = self.frame_transformation(x_frame)
+        y_pose_feature = self.label_transformation(y_pose)
+
+        decoder_output = self.Decoder_Fusion(x_frame_feature, y_pose_feature, z)
+
+        # predicted y frame (predicted t frame)
+        pred_frame = self.Generator(decoder_output)
+
+        return pred_frame
 
     def training_stage(self):
+        # dataloader
+        train_loader = self.train_dataloader()
+        val_loader = self.val_dataloader()
+
+        # best val psnr
+        best_val_psnr = None
+
         for i in range(self.args.num_epoch):
-            train_loader = self.train_dataloader()
+            # update trainloader to full data (end fast train)
+            if self.args.fast_train and self.current_epoch > self.args.fast_train_epoch:
+                self.args.fast_train = False
+                train_loader = self.train_dataloader()
+
+            print(f"Epoch: {self.current_epoch}, train loader len: {len(train_loader)}")
             adapt_TeacherForcing = True if random.random() < self.tfr else False
 
-            for img, label in (pbar := tqdm(train_loader, ncols=120)):
+            # loss
+            sum_loss = 0.0
+            sum_kl_loss = 0.0
+            sum_mse_loss = 0.0
+
+            for img, label in (pbar := tqdm(train_loader)):
                 img = img.to(self.args.device)
                 label = label.to(self.args.device)
-                loss = self.training_one_step(img, label, adapt_TeacherForcing)
 
-                beta = self.kl_annealing.get_beta()
+                loss, kl_loss, mse_loss = self.training_one_step(
+                    img, label, adapt_TeacherForcing
+                )
+                sum_loss += loss.item() * img.size(1)
+                sum_kl_loss += kl_loss.item() * img.size(1)
+                sum_mse_loss += mse_loss.item() * img.size(1)
 
                 if adapt_TeacherForcing:
                     self.tqdm_bar(
                         "train [TeacherForcing: ON, {:.1f}], beta: {}".format(
-                            self.tfr, beta
+                            self.tfr, self.kl_annealing.get_beta()
                         ),
                         pbar,
                         loss.detach().cpu(),
@@ -121,44 +204,157 @@ class VAE_Model(nn.Module):
                 else:
                     self.tqdm_bar(
                         "train [TeacherForcing: OFF, {:.1f}], beta: {}".format(
-                            self.tfr, beta
+                            self.tfr, self.kl_annealing.get_beta()
                         ),
                         pbar,
                         loss.detach().cpu(),
                         lr=self.scheduler.get_last_lr()[0],
                     )
 
+            epoch_loss = sum_loss / len(train_loader.dataset)
+            epoch_kl_loss = sum_kl_loss / len(train_loader.dataset)
+            epoch_mse_loss = sum_mse_loss / len(train_loader.dataset)
+
+            # validation
+            epoch_val_loss, epoch_val_psnr, _ = self.evaluate(val_loader)
+
+            # best psnr
+            if best_val_psnr is None or epoch_val_psnr > best_val_psnr:
+                best_val_psnr = epoch_val_psnr
+                self.save(os.path.join(self.args.save_root, "ckpt", "epoch=best.ckpt"))
+
+            # tensorboard logger
+            self.writer.add_scalar("Loss/train", epoch_loss, self.current_epoch)
+            self.writer.add_scalar("Loss/train/KL", epoch_kl_loss, self.current_epoch)
+            self.writer.add_scalar("Loss/train/MSE", epoch_mse_loss, self.current_epoch)
+            self.writer.add_scalar("Loss/val", epoch_val_loss, self.current_epoch)
+            self.writer.add_scalar("PSNR/val", epoch_val_psnr, self.current_epoch)
+            self.writer.add_scalar(
+                "KL Annealing/beta", self.kl_annealing.get_beta(), self.current_epoch
+            )
+            self.writer.add_scalar(
+                "TeacherForcing/tfr",
+                self.tfr if adapt_TeacherForcing else 0.0,
+                self.current_epoch,
+            )
+
+            # save ckpt
             if self.current_epoch % self.args.per_save == 0:
                 self.save(
                     os.path.join(
-                        self.args.save_root, f"epoch={self.current_epoch}.ckpt"
+                        self.args.save_root, "ckpt", f"epoch={self.current_epoch}.ckpt"
                     )
                 )
 
-            self.eval()
+            # update parameters
             self.current_epoch += 1
             self.scheduler.step()
             self.teacher_forcing_ratio_update()
-            self.kl_annealing.update()
+            self.kl_annealing.update(self.current_epoch)
 
-    @torch.no_grad()
-    def eval(self):
-        val_loader = self.val_dataloader()
-        for img, label in (pbar := tqdm(val_loader, ncols=120)):
-            img = img.to(self.args.device)
-            label = label.to(self.args.device)
-            loss = self.val_one_step(img, label)
-            self.tqdm_bar(
-                "val", pbar, loss.detach().cpu(), lr=self.scheduler.get_last_lr()[0]
-            )
+        print(f"Best PSNR: {best_val_psnr}")
 
     def training_one_step(self, img, label, adapt_TeacherForcing):
-        breakpoint()
-        raise NotImplementedError
+        # enable training mode
+        self.frame_transformation.train()
+        self.label_transformation.train()
+        self.Gaussian_Predictor.train()
+        self.Decoder_Fusion.train()
+        self.Generator.train()
+
+        # loss
+        kl_loss = 0.0
+        mse_loss = 0.0
+
+        # store the t-1 predicted frame for t prediction
+        previous_frame = img[:, 0]
+
+        # training
+        for i in range(img.size(1) - 1):
+            x_frame, y_frame = previous_frame, img[:, i + 1]
+            y_pose = label[:, i + 1]
+
+            # adapt_TeacherForcing: use ground truth frame t for t+1 prediction
+            if adapt_TeacherForcing:
+                x_frame = img[:, i]
+
+            # forward
+            mu, logvar, pred_frame = self.forward(x_frame, y_pose, y_frame)
+
+            # loss
+            kl_loss += kl_criterion(mu, logvar, self.batch_size)
+            mse_loss += self.mse_criterion(pred_frame, y_frame)
+
+            # update previous frame for t+1 prediction
+            previous_frame = pred_frame
+
+        # kl annealing
+        beta = self.kl_annealing.get_beta()
+        loss = mse_loss + beta * kl_loss
+
+        # backward
+        loss.backward()
+
+        # optimizer
+        self.optimizer_step()
+        self.optim.zero_grad()
+
+        return loss, kl_loss, mse_loss
+
+    @torch.no_grad()
+    def evaluate(self, val_loader):
+        for img, label in val_loader:
+            img = img.to(self.args.device)
+            label = label.to(self.args.device)
+
+            loss, psnr, per_frame_psnr = self.val_one_step(img, label)
+
+        return loss, psnr, per_frame_psnr
 
     def val_one_step(self, img, label):
-        # TODO
-        raise NotImplementedError
+        # enable eval mode
+        self.frame_transformation.eval()
+        self.label_transformation.eval()
+        self.Gaussian_Predictor.eval()
+        self.Decoder_Fusion.eval()
+        self.Generator.eval()
+
+        # mse loss
+        mse_loss = 0.0
+
+        # psnr
+        sum_psnr = 0.0
+        per_frame_psnr = []
+
+        predicted_frames = []
+        predicted_frames.append(img[:, 0])
+
+        for i in (pbar := tqdm(range(img.size(1) - 1), ncols=100)):
+            x_frame, y_frame = predicted_frames[-1], img[:, i + 1]
+            y_pose = label[:, i + 1]
+
+            pred_frame = self.forward_inference(x_frame, y_pose)
+            mse_loss += self.mse_criterion(pred_frame, y_frame)
+
+            predicted_frames.append(pred_frame)
+
+            # psnr
+            frame_psnr = Generate_PSNR(pred_frame, y_frame).item()
+            per_frame_psnr.append(frame_psnr)
+            sum_psnr += frame_psnr
+
+            # last iter
+            if i == img.size(1) - 2:
+                self.tqdm_bar(
+                    "val",
+                    pbar,
+                    mse_loss.detach().cpu(),
+                    lr=self.scheduler.get_last_lr()[0],
+                )
+
+        avg_psnr = sum_psnr / (img.size(1) - 1)
+
+        return mse_loss, avg_psnr, per_frame_psnr
 
     def make_gif(self, images_list, img_name):
         new_list = []
@@ -189,8 +385,6 @@ class VAE_Model(nn.Module):
             video_len=self.train_vi_len,
             partial=args.fast_partial if self.args.fast_train else args.partial,
         )
-        if self.current_epoch > self.args.fast_train_epoch:
-            self.args.fast_train = False
 
         train_loader = DataLoader(
             dataset,
@@ -225,8 +419,9 @@ class VAE_Model(nn.Module):
         return val_loader
 
     def teacher_forcing_ratio_update(self):
-        # TODO
-        raise NotImplementedError
+        # start lowering tfr after tfr_sde epoch
+        if self.current_epoch >= self.tfr_sde:
+            self.tfr = max(self.tfr - self.tfr_d_step, 0.0)
 
     def tqdm_bar(self, mode, pbar, loss, lr):
         pbar.set_description(
@@ -269,24 +464,59 @@ class VAE_Model(nn.Module):
         self.optim.step()
 
 
-def main(args):
+def plot_per_frame_psnr(per_frame_psnr, save_root):
+    avg_psnr = round(np.mean(per_frame_psnr), 2)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(per_frame_psnr, label=f"PSNR: {avg_psnr}")
+    plt.xlabel("Frame")
+    plt.ylabel("PSNR")
+    plt.title("Per Frame PSNR")
+    plt.legend()
+
+    plt.savefig(f"{save_root}/per_frame_psnr.png")
+
+
+def create_output_dir(save_root):
     # create output(save_root) directory
-    if args.save_root is not None:
+    if save_root is not None:
         tz = pytz.timezone("Asia/Taipei")
         now = datetime.now(tz).strftime("%Y%m%d-%H%M")
 
-        args.save_root = os.path.join(args.save_root, now)
+        save_root = os.path.join(save_root, now)
 
         # create output directory
-        os.makedirs(args.save_root, exist_ok=True)
+        os.makedirs(save_root, exist_ok=True)
+
+        # create ckpt directory
+        os.makedirs(f"{save_root}/ckpt", exist_ok=True)
 
         # create logs directory
-        os.makedirs(f"{args.save_root}/logs", exist_ok=True)
+        os.makedirs(f"{save_root}/logs", exist_ok=True)
+
+        return save_root
+
+    return None
+
+
+def main(args):
+    # create output dir in training mode
+    if not args.test and args.save_root is not None:
+        args.save_root = create_output_dir(args.save_root)
+
+        # save all args in text
+        with open(f"{args.save_root}/args.txt", "w") as f:
+            for k, v in vars(args).items():
+                f.write(f"{k}: {v}\n")
 
     model = VAE_Model(args).to(args.device)
     model.load_checkpoint()
+
     if args.test:
-        model.eval()
+        val_loader = model.val_dataloader()
+        loss, psnr, per_frame_psnr = model.evaluate(val_loader)
+        plot_per_frame_psnr(per_frame_psnr, args.save_root)
+        print(f"Validation Loss: {loss}, PSNR: {psnr}")
     else:
         model.training_stage()
 
@@ -303,8 +533,8 @@ if __name__ == "__main__":
     parser.add_argument('--store_visualization',      action='store_true', help="If you want to see the result while training")
     parser.add_argument('--DR',            type=str, required=True,  help="Your Dataset Path")
     parser.add_argument('--save_root',     type=str, required=True,  help="The path to save your data")
-    parser.add_argument('--num_workers',   type=int, default=4)
-    parser.add_argument('--num_epoch',     type=int, default=70,     help="number of total epoch")
+    parser.add_argument('--num_workers',   type=int, default=16)
+    parser.add_argument('--num_epoch',     type=int, default=30,     help="number of total epoch")
     parser.add_argument('--per_save',      type=int, default=3,      help="Save checkpoint every seted epoch")
     parser.add_argument('--partial',       type=float, default=1.0,  help="Part of the training dataset to be trained")
     parser.add_argument('--train_vi_len',  type=int, default=16,     help="Training video length")
@@ -331,7 +561,7 @@ if __name__ == "__main__":
     parser.add_argument('--fast_train_epoch',   type=int, default=5,        help="Number of epoch to use fast train mode")
     
     # Kl annealing stratedy arguments
-    parser.add_argument('--kl_anneal_type',     type=str, default='Cyclical',       help="")
+    parser.add_argument('--kl_anneal_type',     type=str, choices=["Cyclical", "Monotonic", "Without"],  default='Cyclical',       help="")
     parser.add_argument('--kl_anneal_cycle',    type=int, default=10,               help="")
     parser.add_argument('--kl_anneal_ratio',    type=float, default=1,              help="")
 

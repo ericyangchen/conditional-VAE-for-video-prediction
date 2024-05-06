@@ -90,11 +90,24 @@ class Test_model(VAE_Model):
         self.val_vi_len = args.val_vi_len
         self.batch_size = args.batch_size
 
-    def forward(self, img, label):
-        pass
+    def forward(self, x_frame, y_pose):
+        # normal noise vector: z
+        z = torch.randn(1, self.args.N_dim, self.args.frame_H, self.args.frame_W)
+        z = z.to(self.args.device)
+
+        # val generator (x_frame: t-1 frame, y_pose: t pose, z: noise vector)
+        x_frame_feature = self.frame_transformation(x_frame)
+        y_pose_feature = self.label_transformation(y_pose)
+
+        decoder_output = self.Decoder_Fusion(x_frame_feature, y_pose_feature, z)
+
+        # predicted y frame (predicted t frame)
+        pred_frame = self.Generator(decoder_output)
+
+        return pred_frame
 
     @torch.no_grad()
-    def eval(self):
+    def evaluate(self):
         val_loader = self.val_dataloader()
         pred_seq_list = []
         for idx, (img, label) in enumerate(tqdm(val_loader, ncols=80)):
@@ -125,8 +138,15 @@ class Test_model(VAE_Model):
         decoded_frame_list = [img[0].cpu()]
         label_list = []
 
-        # TODO
-        raise NotImplementedError
+        previous_frame = img[0]
+        for i in range(label.size(0) - 1):
+            x_frame = previous_frame
+            y_pose = label[i + 1]
+
+            pred_frame = self.forward(x_frame, y_pose)
+
+            decoded_frame_list.append(pred_frame.cpu())
+            label_list.append(y_pose.cpu())
 
         # Please do not modify this part, it is used for visulization
         generated_frame = stack(decoded_frame_list).permute(1, 0, 2, 3, 4)
@@ -199,7 +219,7 @@ def main(args):
 
     model = Test_model(args).to(args.device)
     model.load_checkpoint()
-    model.eval()
+    model.evaluate()
 
 
 if __name__ == "__main__":
@@ -215,7 +235,7 @@ if __name__ == "__main__":
     parser.add_argument('--make_gif',      action='store_true')
     parser.add_argument('--DR',            type=str, required=True,  help="Your Dataset Path")
     parser.add_argument('--save_root',     type=str, required=True,  help="The path to save your data")
-    parser.add_argument('--num_workers',   type=int, default=4)
+    parser.add_argument('--num_workers',   type=int, default=16)
     parser.add_argument('--num_epoch',     type=int, default=70,     help="number of total epoch")
     parser.add_argument('--per_save',      type=int, default=3,      help="Save checkpoint every seted epoch")
     parser.add_argument('--partial',       type=float, default=1.0,  help="Part of the training dataset to be trained")
