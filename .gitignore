@@ -1,0 +1,8 @@
+.vscode
+**/__pycache__
+
+data
+outputs
+demo
+
+.nfs*
